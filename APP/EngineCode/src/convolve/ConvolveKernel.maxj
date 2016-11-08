@@ -1,0 +1,381 @@
+package convolve;
+
+import maxpower.fft.FourierTransform;
+
+import com.maxeler.maxcompiler.v2.kernelcompiler.Kernel;
+import com.maxeler.maxcompiler.v2.kernelcompiler.KernelParameters;
+import com.maxeler.maxcompiler.v2.kernelcompiler.SMIO;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.LMemCommandStream;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Count;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.core.Count.WrapMode;
+import com.maxeler.maxcompiler.v2.kernelcompiler.stdlib.memory.Memory;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.base.DFEFix;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.base.DFEVar;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEComplex;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEComplexType;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEVector;
+import com.maxeler.maxcompiler.v2.kernelcompiler.types.composite.DFEVectorType;
+import com.maxeler.maxcompiler.v2.utils.MathUtils;
+
+class ConvolveKernel extends Kernel {
+
+	// customisable input parameters
+	private static final int KernelSize = 64;
+	private static final int ImageBlockSize = 192; // dividable by FFTblocksize X and Y
+	private static final int ImageSizeX = 5952;
+	private static final int ImageSizeY = 3840;
+	private static final int ImageAddress = 0;
+	private static final int OverlapAddress = 16777216; // 2^24 far away from everything else
+
+	//do not change, fixed constants
+	private static final int BlocksToProcess = (ImageSizeX * ImageSizeY)/ImageBlockSize/ImageBlockSize;
+	private static final int BlocksXDim = ImageSizeX/ImageBlockSize;
+	private static final int BlocksYDim = ImageSizeY/ImageBlockSize;
+	private static final int BlocksizeX = 256;
+	private static final int BlocksizeY = 256;
+	private static final int FFTBlocksizeX = 4;
+	private static final int FFTBlocksizeY = 4;
+	private static final int OverlapX = KernelSize/FFTBlocksizeX; // in FFT Blocks
+	private static final int OverlapY = KernelSize/FFTBlocksizeY; // in FFT Blocks
+	private static final int MemoryDepth = 2 * BlocksizeX * BlocksizeY / FFTBlocksizeX / FFTBlocksizeY; // Elements to be saved
+	private static final int RamAddressWidth = MathUtils.bitsToAddress(MemoryDepth);
+
+	//input vect
+	DFEVectorType<DFEVar> vectType = new DFEVectorType<DFEVar> (dfeUInt(32),FFTBlocksizeX * FFTBlocksizeY); // *2 due to real input
+	DFEComplexType doubleCPLXType = new DFEComplexType(dfeFloat(11,53)); // kernel
+	DFEVectorType<DFEComplex> doubleVectCPLXType = new  DFEVectorType<DFEComplex> (doubleCPLXType, FFTBlocksizeX);
+	DFEVectorType<DFEVector<DFEComplex>> kernelVectType = new DFEVectorType<DFEVector<DFEComplex>> (doubleVectCPLXType, FFTBlocksizeY);
+
+	//output vect
+	DFEComplexType floatCPLXType = new DFEComplexType(dfeFloat(8,24));
+	DFEVectorType<DFEComplex> vectCPLXType = new  DFEVectorType<DFEComplex> (floatCPLXType, FFTBlocksizeX);
+	DFEVectorType<DFEVector<DFEComplex>> outVectType = new DFEVectorType<DFEVector<DFEComplex>> (vectCPLXType, FFTBlocksizeY);
+	DFEVectorType<DFEVar> floatType = new DFEVectorType<DFEVar> (dfeFloat(8,24), FFTBlocksizeX);
+	DFEVectorType<DFEVector<DFEVar>> outVectFloatType = new DFEVectorType<DFEVector<DFEVar>> (floatType, FFTBlocksizeY);
+
+
+	// vect for internal computation
+	DFEFix fixType = dfeFix(17,15,DFEFix.SignMode.TWOSCOMPLEMENT); //real
+	DFEVectorType<DFEVar> fixOverlapVectType = new DFEVectorType<DFEVar>(fixType, FFTBlocksizeX);
+	DFEVectorType<DFEVector<DFEVar>> fixOverlapType = new DFEVectorType<DFEVector<DFEVar>>(fixOverlapVectType, FFTBlocksizeY);
+	DFEComplexType fixCPLXType = new DFEComplexType(fixType); //complex
+	DFEVectorType<DFEComplex> fftFixVectType = new DFEVectorType<DFEComplex> (fixCPLXType, FFTBlocksizeX);
+	DFEVectorType<DFEVector<DFEComplex>> fixVectType = new DFEVectorType<DFEVector<DFEComplex>> (fftFixVectType, FFTBlocksizeY);
+
+
+	protected ConvolveKernel(KernelParameters parameters) {
+		super(parameters);
+
+		SMIO smRead = addStateMachine("ReadControlMachine",new ReadControlStateMachine(this));
+		smRead.connectInput("dimy", constant.var(dfeUInt(18),BlocksizeY / FFTBlocksizeY));
+		smRead.connectInput("dimx", constant.var(dfeUInt(18),BlocksizeX / FFTBlocksizeX));
+		smRead.connectInput("stopExecution", constant.var(dfeUInt(1),0));
+		DFEVar ramAddress = smRead.getOutput("Address");
+		DFEVar ramAddressTransposed = smRead.getOutput("TransposedAddress");
+		DFEVar transposedOperation = smRead.getOutput("TransposedOperation"); // Buffer address switch
+		DFEVar iterationCount = smRead.getOutput("IterationCount");
+		DFEVar done = smRead.getOutput("EndMarker"); //Block done
+		DFEVar addressX = smRead.getOutput("AddressX");
+		DFEVar addressY = smRead.getOutput("AddressY");
+
+
+///////////////////Counter for Overlap////////////////////////////
+		Count.Params  overlapBlockXParams = control.count.makeParams(32).withEnable(done & iterationCount > 1).withMax(BlocksXDim);
+		Count.Counter overlapBlockXCounter = control.count.makeCounter(overlapBlockXParams);
+		DFEVar overlapBlockCountX = overlapBlockXCounter.getCount();
+		DFEVar lineDone = overlapBlockXCounter.getWrap();
+		DFEVar lastBlockInLine = overlapBlockCountX === BlocksXDim - 1;
+		// read Counter is offset by one, done by pulse on first clock cycle
+		Count.Params  overlapReadXParams = control.count.makeParams(32).withEnable(done & iterationCount > 1 | control.count.pulse(1)).withMax(BlocksXDim);
+		Count.Counter overlapReadXCounter = control.count.makeCounter(overlapReadXParams);
+		Count.Params  overlapBlockYParams = control.count.makeParams(32).withEnable(lineDone).withMax(BlocksYDim - 1).withWrapMode(WrapMode.STOP_AT_MAX);
+		Count.Counter overlapBlockYCounter = control.count.makeCounter(overlapBlockYParams);
+		DFEVar overlapBlockCountY = overlapBlockYCounter.getCount();
+
+
+/////////////////////// Counter for LMEM address generation////////////////////////
+		int burstsPerBlock = ImageBlockSize * ImageBlockSize * vectType.getContainedType().getTotalBytes() / 384;
+		//48 = desired Burstsize, with imagesize = 192x192, always divisible without remainder
+		int intermediateReads = burstsPerBlock / 48;
+		int spacing  = (ImageBlockSize / FFTBlocksizeY) / intermediateReads; //spacing between reads/writes
+
+		////// pseudo Modulo function (addressY mod spacing) up to a value of (intermediateReads-1) * spacing
+		DFEVectorType<DFEVar> moduloType = new DFEVectorType<DFEVar> (dfeUInt(1), intermediateReads);
+		DFEVector<DFEVar> modulo = moduloType.newInstance(this);
+		for(int i = 0; i < intermediateReads; i++)
+		{
+			modulo[i] <== addressY === i * spacing;
+		}
+
+		DFEVar readEnableLMEM = ( dfeUInt(intermediateReads).unpack(modulo.pack()) > 0 & addressX === 0
+			& addressY < ImageBlockSize / FFTBlocksizeY & iterationCount < BlocksXDim * BlocksYDim) | control.count.pulse(2); //Enable read has to be one ahead,
+		DFEVar writeEnableLMEM = dfeUInt(intermediateReads).unpack(modulo.pack()) > 0 & addressX === 0
+			& iterationCount > 1 & iterationCount < BlocksXDim * BlocksYDim + 2; //latency 2
+
+		Count.Params readAddParam = control.count.makeParams(28).withMax(intermediateReads).withEnable(readEnableLMEM);
+		Count.Counter readAdd = control.count.makeCounter(readAddParam);
+		Count.Params writeAddParam = control.count.makeParams(28).withMax(intermediateReads).withEnable(writeEnableLMEM);
+		Count.Counter writeAdd = control.count.makeCounter(writeAddParam);
+
+		Count.Params  writeParams = control.count.makeParams(28).withEnable(writeAdd.getWrap()).withMax(BlocksXDim * BlocksYDim);
+		Count.Counter writeCounter = control.count.makeCounter(writeParams);
+		Count.Params  readParams = control.count.makeParams(28).withEnable(readAdd.getWrap()).withMax(BlocksXDim * BlocksXDim);
+		Count.Counter readCounter = control.count.makeCounter(readParams);
+
+		Count.Params oneShotParams = control.count.makeParams(1).withMax(1).withWrapMode(WrapMode.STOP_AT_MAX).withEnable(
+				(writeCounter.getCount() === BlocksXDim * BlocksYDim - 1) & (writeAdd.getCount() === intermediateReads - 1));
+		Count.Counter oneShot = control.count.makeCounter(oneShotParams);
+		LMemCommandStream.makeKernelOutput("imageReadCommandStream",
+				readEnableLMEM,
+				ImageAddress + (readCounter.getCount() * burstsPerBlock).cast(dfeUInt(28)) + (readAdd.getCount() * 48).cast(dfeUInt(28)),
+				constant.var(dfeUInt(8), 48),// size
+				constant.var(dfeUInt(1), 1),// inc
+				constant.var(dfeUInt(2), 0),// stream
+				constant.var(false));
+		LMemCommandStream.makeKernelOutput("imageWriteCommandStream",
+				writeEnableLMEM ,
+				ImageAddress + (writeCounter.getCount() * burstsPerBlock).cast(dfeUInt(28)) + (writeAdd.getCount() * 48).cast(dfeUInt(28)),// start address in bursts
+				constant.var(dfeUInt(8), 48),// number of bursts to write
+				constant.var(dfeUInt(1), 1),// number of bursts added to address after each burst
+				constant.var(dfeUInt(2), 0),// stream
+				oneShot.getCount());
+
+
+/////////////////////////////////Counter for LMEM address generation/////////////////////////
+		Memory<DFEVector<DFEVector<DFEComplex>>> fftBuffer = mem.alloc(fixVectType, MemoryDepth);
+		Memory<DFEVector<DFEVector<DFEComplex>>> ifftBuffer = mem.alloc(fixVectType, MemoryDepth);
+		Memory<DFEVector<DFEVector<DFEComplex>>> filterKernel = mem.alloc(fixVectType, MemoryDepth / 2); //no double buffer needed
+		// OverlapX Buffer CHOOSE MAX SIZE 
+		Memory<DFEVector<DFEVector<DFEVar>>> overlapBuffer = mem.alloc(fixOverlapType, 128 * 128 / FFTBlocksizeX / FFTBlocksizeY);
+
+		DFEVar readEnable = iterationCount < BlocksToProcess
+		 & addressX < ImageBlockSize/FFTBlocksizeX & addressY < ImageBlockSize / FFTBlocksizeY;
+		DFEVar writeEnable = addressY < ImageBlockSize / FFTBlocksizeY & addressX < ImageBlockSize / FFTBlocksizeX
+		 & iterationCount > 1 & iterationCount < BlocksToProcess + 2;
+
+		//fill kernel coefficient vector during first iteration (needed in the 2nd)
+		DFEVector<DFEVector<DFEComplex>> kernelInput = io.input("Kernel", kernelVectType,iterationCount === 0);
+		filterKernel.write(ramAddress.cast(dfeUInt(MathUtils.bitsToAddress(MemoryDepth/2))), kernelInput.cast(fixVectType), iterationCount === 0);
+		DFEVector<DFEVector<DFEComplex>> kernelVal = filterKernel.read(ramAddress.cast(dfeUInt(MathUtils.bitsToAddress(MemoryDepth/2))));
+
+///////////////////input//////////////////////////////////
+		DFEVector<DFEVar> input = io.input("x", vectType,readEnable);
+		io.forceExactIOSeparation("x", "imageReadCommandStream", -1);
+		// prepare the input for the fft (convert to complex values)
+		DFEVector<DFEVector<DFEComplex>> streamInput = fixVectType.newInstance(this);
+		for (int i = 0; i < streamInput.getSize(); i++) {
+			for (int j = 0; j < streamInput[0].getSize(); j++) {
+				streamInput[i][j].setReal(input[j+i*streamInput[0].getSize()].cast(fixType));
+				streamInput[i][j].setImaginary(constant.var(fixType,0));
+				// imag part can hold another real picture
+			}
+		}
+
+
+//////////////////// insert Padding///////////////////////////////////
+		DFEVector<DFEVector<DFEComplex>> zeroVect = fixVectType.newInstance(this);
+		for(int i = 0; i < zeroVect.getSize(); i++)
+			for(int j = 0; j < zeroVect[0].getSize(); j++)
+				zeroVect[i][j] <== constant.cplx(fixType, 0, 0);
+
+		DFEVector<DFEVector<DFEComplex>> inputMux = muxInput(readEnable, zeroVect, streamInput);
+
+
+//////////////////////////first FFT + transpose////////////////////////////////////
+		DFEVector<DFEVector<DFEComplex>> firstFFTout = fixVectType.newInstance(this);
+		for(int i = 0; i < fixVectType.getSize(); i++)
+		{
+			DFEVector<DFEComplex> vector = FourierTransform.fft(256,inputMux[i]);
+			for(int j = 0; j < fftFixVectType.getSize(); j++)
+				firstFFTout[i][j] <==  shiftCPLXright(vector[j],8);
+		}
+
+		DFEVector<DFEVector<DFEComplex>> transposeFFTsmall = transpose(firstFFTout);
+		fftBuffer.write(ramAddressTransposed.cast(dfeUInt(RamAddressWidth))
+				+ (transposedOperation ? constant.var(dfeUInt(RamAddressWidth),MemoryDepth/2) : 0),
+				transposeFFTsmall,constant.var(dfeUInt(1),1));
+
+		// read data for 2nd FFT, valid when first Iteration over
+		DFEVector<DFEVector<DFEComplex>> transposeFFTResult = fftBuffer.read(ramAddress.cast(dfeUInt(RamAddressWidth))
+				+ (transposedOperation ? 0 : constant.var(dfeUInt(RamAddressWidth),MemoryDepth/2)));
+
+
+/////////////////////////// 2nd FFT + multiplication with Kernel////////////////////////////
+		DFEVector<DFEVector<DFEComplex>> secondFFTout = fixVectType.newInstance(this);
+		for(int i = 0; i < fixVectType.getSize(); i++)
+		{
+			DFEVector<DFEComplex> vector = FourierTransform.fft(256,transposeFFTResult[i]);
+			for(int j = 0; j < fftFixVectType.getSize(); j++)
+				secondFFTout[i][j] <==  (vector[j] * kernelVal[i][j]);
+		}
+
+
+///////////////////////////first IFFT + transpose/////////////////////////
+		DFEVector<DFEVector<DFEComplex>> firstIFFTout = fixVectType.newInstance(this);
+		for(int i = 0; i < fixVectType.getSize(); i++)
+		{
+			DFEVector<DFEComplex> vector = FourierTransform.ifft(256,secondFFTout[i]);
+			for(int j = 0; j < fftFixVectType.getSize(); j++)
+				firstIFFTout[i][j] <==  shiftCPLXleft(vector[j],8);
+		}
+		DFEVector<DFEVector<DFEComplex>> transposeIFFTsmall = transpose(firstIFFTout);
+
+		ifftBuffer.write(ramAddressTransposed.cast(dfeUInt(RamAddressWidth))
+				+ (transposedOperation ? constant.var(dfeUInt(RamAddressWidth),MemoryDepth/2) : 0),
+				transposeIFFTsmall,constant.var(dfeUInt(1),1));
+		DFEVector<DFEVector<DFEComplex>> transposeIFFTResult = ifftBuffer.read(ramAddress.cast(dfeUInt(RamAddressWidth))
+				+ (transposedOperation ? 0 : constant.var(dfeUInt(RamAddressWidth),MemoryDepth/2)));
+
+
+////////////////////second IFFT///////////////////////////
+		DFEVector<DFEVector<DFEComplex>> secondIFFTout = fixVectType.newInstance(this);
+		DFEVector<DFEVector<DFEVar>> overlapOut = fixOverlapType.newInstance(this);
+
+		for(int i = 0; i < fixVectType.getSize(); i++)
+		{
+			DFEVector<DFEComplex> vector = FourierTransform.ifft(256,transposeIFFTResult[i]);
+			for(int j = 0; j < fftFixVectType.getSize(); j++)
+				{
+				secondIFFTout[i][j] <==  vector[j];
+				overlapOut[i][j] <== vector[j].getReal(); // save Overlap before any additions
+				}
+		}
+
+
+/////////////////////detect and save Overlapping blocks///////////////////////////////////
+		DFEVar overlapDetected = addressX > ImageBlockSize/FFTBlocksizeX - 1 & addressX < ImageBlockSize/FFTBlocksizeX + OverlapX
+								 & addressY < ImageBlockSize/FFTBlocksizeY + OverlapY;
+		Count.Params overlapAddressParams = control.count.makeParams(MathUtils.bitsToAddress(128 * 128 / FFTBlocksizeX / FFTBlocksizeY)).withMax(OverlapX * (ImageBlockSize / FFTBlocksizeY + OverlapY)).withEnable(overlapDetected);
+		Count.Counter overlapAddress = control.count.makeCounter(overlapAddressParams);
+		overlapBuffer.write(overlapAddress.getCount(), overlapOut, overlapDetected);
+
+		DFEVar readOverlapDetected = addressX < OverlapX & addressY < OverlapY + ImageBlockSize / FFTBlocksizeY;
+		Count.Params readOverlapAddressParams = control.count.makeParams(MathUtils.bitsToAddress(128 * 128 / FFTBlocksizeX / FFTBlocksizeY)).withMax(OverlapX * (ImageBlockSize / FFTBlocksizeY + OverlapY)).withEnable(readOverlapDetected);
+		Count.Counter readOverlapAddress = control.count.makeCounter(readOverlapAddressParams);
+		DFEVector<DFEVector<DFEVar>> overlapIn = overlapBuffer.read(readOverlapAddress.getCount());
+
+		// overlaps in both directions have to be added in the bottom left corner!
+		DFEVar bottomCorner = addressX < OverlapX & addressY > ImageBlockSize / FFTBlocksizeY - 1 & addressY < OverlapY + ImageBlockSize / FFTBlocksizeY;
+		DFEVector<DFEVector<DFEVar>> zeroOverlapVect = fixOverlapType.newInstance(this);
+		for(int i = 0; i < zeroOverlapVect.getSize(); i++)
+			for(int j = 0; j < zeroOverlapVect[0].getSize(); j++)
+				zeroOverlapVect[i][j] <== constant.var(fixType, 0);
+		DFEVector<DFEVector<DFEVar>> vertOverlapIn = overlapOut + (bottomCorner ? overlapIn : zeroOverlapVect);
+
+		DFEVar overlapTop = addressY < OverlapY & addressX < OverlapX + ImageBlockSize / FFTBlocksizeX;
+		DFEVar overlapBottom = addressY > ImageBlockSize / FFTBlocksizeY - 1 & addressY < ImageBlockSize / FFTBlocksizeY + OverlapY
+		& addressX < ImageBlockSize / FFTBlocksizeX + OverlapX;
+
+		// check whether burst size matches the block size
+		int burstSize = OverlapY * (OverlapX + ImageBlockSize / FFTBlocksizeX) * FFTBlocksizeY * FFTBlocksizeX * fixType.getTotalBytes();
+		int noBursts  = (int) Math.ceil(burstSize / 384.0); //round up to get full Bursts
+		int noDummy = 0;
+		int check = (int)Math.round((noBursts - burstSize / 384.0) * 384.0) % (FFTBlocksizeY * FFTBlocksizeX * fixType.getTotalBytes());
+
+		if( check != 0 ) // if not divisible something is wrong
+			throw new RuntimeException("Error: Block size does not match the dummy size (change so that dummy size is a multiple of Block size)");
+		else
+			noDummy = (int) Math.round( (noBursts - burstSize / 384.0) * 384.0 // get no of Bytes in Burst
+			/ (FFTBlocksizeY * FFTBlocksizeX * fixType.getTotalBytes()) );
+		DFEVar dummyEnable = (addressY === ImageBlockSize / FFTBlocksizeY + OverlapX) & addressX  < noDummy;
+
+		// IO functions operate on FIFO buffer
+		DFEVector<DFEVector<DFEVar>>  inBuffer = io.input("vertOverlapIn",fixOverlapType,
+				(overlapTop|dummyEnable) & overlapBlockCountY > 0);
+		DFEVector<DFEVector<DFEVar>> overlapVertical = (overlapTop|dummyEnable) & overlapBlockCountY > 0 ?
+				inBuffer : zeroOverlapVect;
+		io.output("vertOverlapOut",vertOverlapIn,fixOverlapType,
+				(overlapBottom|dummyEnable) & iterationCount > 1);
+
+		//!!does not work if no Overlap!!
+		DFEVar rEnable = (addressY === (ImageBlockSize / FFTBlocksizeY + OverlapY)) & addressX === 0;
+		DFEVar wEnable = (addressX === (BlocksizeX / FFTBlocksizeX - 1))  & (addressY === (BlocksizeY / FFTBlocksizeY - 1));
+
+	LMemCommandStream.makeKernelOutput("inputCommandStream",
+			rEnable & (overlapBlockCountY > 0 | lastBlockInLine), // activate at  last block of line, then keep running
+			OverlapAddress + overlapReadXCounter.getCount() * noBursts,
+			constant.var(dfeUInt(8), noBursts),// size
+			constant.var(dfeUInt(1), 1),// inc
+			constant.var(dfeUInt(1), 0),// stream
+			constant.var(false));
+	LMemCommandStream.makeKernelOutput("outputCommandStream",
+			wEnable & iterationCount > 1,// control
+			OverlapAddress + overlapBlockCountX * noBursts,// start address in bursts
+			constant.var(dfeUInt(8), noBursts),// number of bursts to write
+			constant.var(dfeUInt(1), 1),// number of bursts added to address after each burst
+			constant.var(dfeUInt(1), 0),// stream
+			constant.var(false));
+
+
+////////////////////////Add overlapping Blocks/////////////////////////////////////
+		DFEVector<DFEVector<DFEComplex>> result = fixVectType.newInstance(this);
+		for(int i = 0; i < fixVectType.getSize(); i++)
+		{
+			for(int j = 0; j < fftFixVectType.getSize(); j++)
+			{
+				DFEComplex vectorHorizontal = fixCPLXType.newInstance(this);
+				vectorHorizontal.setReal(overlapIn[i][j]);
+				vectorHorizontal.setImaginary(constant.var(fixType,0));
+				DFEComplex vectorVertical = fixCPLXType.newInstance(this);
+				vectorVertical.setReal(overlapVertical[i][j]);
+				vectorVertical.setImaginary(constant.var(fixType,0));
+				result[i][j] <==  secondIFFTout[i][j]
+                                    +(readOverlapDetected ? vectorHorizontal : constant.cplx(fixCPLXType,0,0))
+                                    +(overlapTop ? vectorVertical : constant.cplx(fixCPLXType,0,0));
+			}
+		}
+
+
+////////////// strip result of imaginary part and output/////////////////////////
+		DFEVector<DFEVector<DFEVar>> outBuf = fixOverlapType.newInstance(this);
+		for(int i = 0; i < fixVectType.getSize(); i++)
+			for(int j = 0; j < fftFixVectType.getSize(); j++)
+				outBuf[i][j] <== result[i][j].getReal();
+
+		io.output("s", outBuf.cast(outVectFloatType), outVectFloatType, writeEnable);
+
+		debug.simPrintf(done,"Iteration %d of %d \n", iterationCount,BlocksToProcess);
+
+	}
+
+
+//////////////// helper functions//////////////////////////////////////
+	DFEVector<DFEVector<DFEComplex>>
+	muxInput(DFEVar sel, DFEVector<DFEVector<DFEComplex>> in1, DFEVector<DFEVector<DFEComplex>> in2)
+	{
+		DFEVector<DFEVector<DFEComplex>> outVect = fixVectType.newInstance(this);
+		for(int i = 0; i < in1.getSize(); i++)
+			for(int j = 0; j < in1[0].getSize(); j++)
+				outVect[i][j] <== control.mux(sel, in1[i][j], in2[i][j]);
+		return outVect;
+	}
+
+	DFEVector<DFEVector<DFEComplex>>transpose(DFEVector<DFEVector<DFEComplex>> in)
+	{
+		DFEVectorType<DFEComplex> fixVectTypeBundled = new DFEVectorType<DFEComplex>(fixCPLXType,FFTBlocksizeX * FFTBlocksizeY);
+		DFEVector<DFEComplex> buffer = fixVectTypeBundled.newInstance(this);
+
+		DFEVector<DFEVector<DFEComplex>> out = fixVectType.newInstance(this);
+
+		for(int i = 0; i < in.getSize(); i++)
+			for(int j = 0; j < in[0].getSize(); j++)
+				buffer[j * in.getSize() + i] <== in[i][j];
+
+		out <== fixVectType.unpack(buffer.pack());
+		return out;
+	}
+	DFEComplex shiftCPLXright(DFEComplex in, int amount)
+	{
+		DFEComplex out =  in.getType().newInstance(this);
+		out.setReal(in.getReal().shiftRight(amount));
+		out.setImaginary(in.getImaginary().shiftRight(amount));
+		return out;
+	}
+	DFEComplex shiftCPLXleft(DFEComplex in, int amount)
+	{
+		DFEComplex out = in.getType().newInstance(this);
+		out.setReal(in.getReal().shiftLeft(amount));
+		out.setImaginary(in.getImaginary().shiftLeft(amount));
+		return out;
+	}
+}

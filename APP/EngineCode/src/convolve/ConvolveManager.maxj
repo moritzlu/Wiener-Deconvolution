@@ -1,0 +1,107 @@
+package convolve;
+
+import com.maxeler.maxcompiler.v2.managers.BuildConfig;
+import com.maxeler.maxcompiler.v2.managers.BuildConfig.Effort;
+import com.maxeler.maxcompiler.v2.managers.custom.CustomManager;
+import com.maxeler.maxcompiler.v2.managers.custom.DFELink;
+import com.maxeler.maxcompiler.v2.managers.custom.ManagerClock;
+import com.maxeler.maxcompiler.v2.managers.custom.blocks.KernelBlock;
+import com.maxeler.maxcompiler.v2.managers.custom.stdlib.DebugLevel;
+import com.maxeler.maxcompiler.v2.managers.custom.stdlib.LMemCommandGroup;
+import com.maxeler.maxcompiler.v2.managers.custom.stdlib.LMemInterface;
+import com.maxeler.maxcompiler.v2.managers.engine_interfaces.CPUTypes;
+import com.maxeler.maxcompiler.v2.managers.engine_interfaces.EngineInterface;
+import com.maxeler.maxcompiler.v2.managers.engine_interfaces.EngineInterface.Direction;
+import com.maxeler.maxcompiler.v2.managers.engine_interfaces.InterfaceParam;
+
+public class ConvolveManager extends CustomManager {
+
+	private static final String s_kernelName = "ConvolveKernel";
+	public ManagerClock abc = generateStreamClock("KernelClock",200);
+
+	public ConvolveManager(ConvolveEngineParameters engineParameters) {
+		super(engineParameters);
+
+		KernelBlock block = addKernel(new ConvolveKernel(makeKernelParameters(s_kernelName)));
+		block.setClock(abc);
+		debug.setDebugLevel(new DebugLevel().setHasStreamStatus(true));
+		LMemInterface iface = addLMemInterface();
+		DFELink fromCPU =addStreamFromCPU("cpu_to_lmem");
+		DFELink toCPU = addStreamToCPU("tocpu");
+		DFELink cpu2lmem = iface.addStreamToLMem("cpu2lmem", LMemCommandGroup.MemoryAccessPattern.LINEAR_1D);
+		DFELink lmem2cpu = iface.addStreamFromLMem("lmem2cpu",LMemCommandGroup.MemoryAccessPattern.LINEAR_1D);
+
+		cpu2lmem <== fromCPU;
+		toCPU<== lmem2cpu;
+
+		block.getInput("x") <== iface.addStreamFromLMem("x", block.getOutput("imageReadCommandStream"));
+		DFELink ImageOut = iface.addStreamToLMem("s", block.getOutput("imageWriteCommandStream"));
+		ImageOut <== block.getOutput("s");
+
+		block.getInput("vertOverlapIn") <== iface.addStreamFromLMem("vertOverlapIn", block.getOutput("inputCommandStream"));
+		DFELink LMEMout = iface.addStreamToLMem("vertOverlapOut", block.getOutput("outputCommandStream"));
+		LMEMout <== block.getOutput("vertOverlapOut");
+
+
+		block.getInput("Kernel").connect(addStreamFromCPU("Kernel"));
+
+		createSLiCinterface(modeDefault());
+		createSLiCinterface(modeWrite("writeLMem"));
+		createSLiCinterface(modeRead("readLMem"));
+
+		configBuild(engineParameters);
+	}
+
+	private static EngineInterface modeDefault() {
+		EngineInterface engine_interface = new EngineInterface();
+		CPUTypes doubleType = CPUTypes.DOUBLE;
+
+		InterfaceParam  N  = engine_interface.addParam("BlockNumber", CPUTypes.INT);
+		InterfaceParam blockNumber = (N + 2) * 4096; // latency of 2
+
+		engine_interface.setLMemInterruptOn("s");
+
+		engine_interface.setTicks(s_kernelName, blockNumber );
+		engine_interface.setStream("Kernel", doubleType, doubleType.sizeInBytes() * 256 * 256 * 2);
+		engine_interface.ignoreAll(Direction.IN_OUT);
+
+		return engine_interface;
+	}
+	private static EngineInterface modeWrite(String name) {
+		EngineInterface engine_interface = new EngineInterface(name);
+
+		InterfaceParam nbytes = engine_interface.addParam("nbytes", CPUTypes.INT);
+		InterfaceParam start = engine_interface.addParam("address", CPUTypes.INT);
+
+		engine_interface.setStream("cpu_to_lmem", CPUTypes.INT32, nbytes);
+		engine_interface.setLMemLinear("cpu2lmem", start ,nbytes);
+		engine_interface.ignoreAll(Direction.IN_OUT);
+		return engine_interface;
+	}
+
+	private static EngineInterface modeRead(String name) {
+		EngineInterface engine_interface = new EngineInterface(name);
+
+		InterfaceParam nbytes = engine_interface.addParam("nbytes", CPUTypes.INT);
+		InterfaceParam start = engine_interface.addParam("address", CPUTypes.INT);
+
+		engine_interface.setStream("tocpu", CPUTypes.INT32, nbytes);
+		engine_interface.setLMemLinear("lmem2cpu",start, nbytes);
+		engine_interface.ignoreAll(Direction.IN_OUT);
+		return engine_interface;
+	}
+
+	private void configBuild(ConvolveEngineParameters params) {
+		BuildConfig buildConfig = getBuildConfig();
+		buildConfig.setMPPRCostTableSearchRange(params.getMPPRStartCT(), params.getMPPREndCT());
+		buildConfig.setMPPRParallelism(params.getMPPRThreads());
+		buildConfig.setMPPRRetryNearMissesThreshold(params.getMPPRRetryThreshold());
+		buildConfig.setBuildEffort(Effort.HIGH);
+	}
+
+	public static void main(String[] args) {
+		ConvolveManager manager = new ConvolveManager(new ConvolveEngineParameters(args));
+		manager.config.setAllowNonMultipleTransitions(true);
+		manager.build();
+	}
+}

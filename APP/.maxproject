@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<maxCompilerManager version="2">
+<enginePart internalEngineSubproject="Convolver_fullPipeline_pub_EngineCode" isSrcBin="false" isUseDefaultSelected="false" outputLocation="/Convolver_fullPipeline_pub_EngineCode/bin" projectName="Convolver_fullPipeline_pub"/>
+<cpuPart internalCpuSubproject="Convolver_fullPipeline_pub_CPUCode"/>
+<watchedFiles/>
+</maxCompilerManager>

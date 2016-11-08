@@ -1,0 +1,118 @@
+package convolve;
+
+import com.maxeler.maxcompiler.v2.kernelcompiler.KernelLib;
+import com.maxeler.maxcompiler.v2.statemachine.DFEsmInput;
+import com.maxeler.maxcompiler.v2.statemachine.DFEsmOutput;
+import com.maxeler.maxcompiler.v2.statemachine.DFEsmStateEnum;
+import com.maxeler.maxcompiler.v2.statemachine.DFEsmStateValue;
+import com.maxeler.maxcompiler.v2.statemachine.kernel.KernelStateMachine;
+import com.maxeler.maxcompiler.v2.statemachine.types.DFEsmValueType;
+
+class ReadControlStateMachine extends KernelStateMachine {
+	enum States { COUNTING_UP, CHECK, DUMMY_CYCLES, PROGRAM_END}
+
+	// I/O
+	private final DFEsmOutput oAddress;
+	private final DFEsmOutput oTransposedAddress;
+	private final DFEsmOutput oAddressX;
+	private final DFEsmOutput oAddressY;
+	private final DFEsmOutput oTransposeOperation;
+	private final DFEsmOutput oEnd;
+	private final DFEsmOutput oIterationCount;
+	private final DFEsmInput iDimx;
+	private final DFEsmInput iDimy;
+	private final DFEsmInput iStop;
+
+	// State
+	private final DFEsmStateValue sAddressX;
+	private final DFEsmStateValue sAddressY;
+	private final DFEsmStateValue sTransposeOperation;
+	private final DFEsmStateValue sEnd;
+	private final DFEsmStateValue sIterationCounter;
+	private final DFEsmStateEnum<States> sMode;
+
+	public ReadControlStateMachine(KernelLib owner) {
+		super(owner);
+		DFEsmValueType counterType = dfeUInt(18);
+
+		// I/O
+		oAddress = io.output("Address", counterType);
+		oTransposedAddress = io.output("TransposedAddress", counterType);
+		oAddressX = io.output("AddressX", counterType);
+		oAddressY = io.output("AddressY", counterType);
+		oTransposeOperation = io.output("TransposedOperation", dfeUInt(1));
+		oEnd = io.output("EndMarker", dfeUInt(1));
+		oIterationCount = io.output("IterationCount", dfeUInt(32));
+
+		iDimy = io.input("dimy", dfeUInt(18));
+		iDimx = io.input("dimx", dfeUInt(18));
+		iStop = io.input("stopExecution", dfeUInt(1));
+
+		// State
+		sMode = state.enumerated(States.class, States.COUNTING_UP);
+		sEnd = state.value(dfeUInt(1),0);
+		sAddressX = state.value(counterType, 0);
+		sAddressY = state.value(counterType, 0);
+		sTransposeOperation = state.value(dfeUInt(1),0);
+		sIterationCounter = state.value(dfeUInt(32),0);
+
+	}
+	@Override
+	protected void nextState() {
+		SWITCH(sMode) {
+			CASE(States.COUNTING_UP) {
+				IF(sAddressY === iDimy - 1 & sAddressX === iDimx - 2) //-2 to match cycle no
+				{
+					sMode.next <== States.CHECK;
+					sEnd.next <== 1;
+				}
+
+				IF(sAddressX === iDimx - 1)
+				{
+					sAddressY.next <== sAddressY + 1;
+					sAddressX.next <== 0;
+				}
+				ELSE
+					sAddressX.next <== sAddressX + 1;
+			}
+			CASE(States.CHECK) {
+				sAddressX.next <== 0;
+				sAddressY.next <== 0;
+				sEnd.next <== 0;
+
+				IF(iStop)
+				{
+					sMode.next <== States.PROGRAM_END;
+					sIterationCounter.next <== 0;
+					sTransposeOperation.next <== 0;
+				}
+				ELSE
+				{
+					sMode.next <== States.COUNTING_UP;
+					sIterationCounter.next <== sIterationCounter + 1;
+					IF( sTransposeOperation === 0) // every uneven iteration has to be transposed
+						sTransposeOperation.next <== 1;
+					ELSE
+						sTransposeOperation.next <== 0;
+				}
+			}
+
+			CASE(States.PROGRAM_END) {
+					sEnd.next <== 1;
+					sMode.next <== States.PROGRAM_END;
+			}
+			OTHERWISE {}
+		}
+	}
+
+	@Override
+	protected void outputFunction() {
+		oAddress <== sAddressY * iDimx + sAddressX;
+		oTransposedAddress <== sAddressX * iDimy + sAddressY;
+		oAddressX <== sAddressX;
+		oAddressY <== sAddressY;
+		oTransposeOperation <== sTransposeOperation;
+		oEnd <== sEnd;
+		oIterationCount <== sIterationCounter;
+	}
+}
